@@ -133,6 +133,7 @@ def conv2d_forward(
             ins[0],
             ins[1],
             outs[0],
+            group_count,
         ),
         name="y",
     )

@@ -112,12 +112,12 @@ TVM_REGISTER_GLOBAL("tvm.contrib.miopen.conv2d.setup").set_body([](TVMArgs args,
   float* output_buf = static_cast<float*>(
       rocm_api->AllocWorkspace(entry_ptr->conv_entry.device, output_size * sizeof(float)));
 
-  const int request_algo_count = 4;
-  const bool exhaustive_search = false;
+  const int request_algo_count = 5;
+  const bool exhaustive_search = true;
   void* workspace = entry_ptr->conv_entry.workspace;
   if (workspace_size == 0) workspace = nullptr;
   int returned_algo_count = 0;
-  miopenConvAlgoPerf_t perfs[4];
+  miopenConvAlgoPerf_t perfs[5];
 
   MIOPEN_CALL(miopenFindConvolutionForwardAlgorithm(
       entry_ptr->handle, entry_ptr->conv_entry.input_desc, input_buf,
@@ -134,6 +134,7 @@ TVM_REGISTER_GLOBAL("tvm.contrib.miopen.conv2d.setup").set_body([](TVMArgs args,
       "miopenConvolutionFwdAlgoDirect",
       "miopenConvolutionFwdAlgoFFT",
       "miopenConvolutionFwdAlgoWinograd",
+      "miopenConvolutionFwdAlgoImplicitGEMM",
   };
   const auto best_algo = perfs[0].fwd_algo;
   LOG(INFO) << "\tMIOpen Found " << returned_algo_count << " fwd algorithms, choosing "
@@ -161,8 +162,12 @@ TVM_REGISTER_GLOBAL("tvm.contrib.miopen.conv2d.forward")
       const DLTensor* x = args[9];
       const DLTensor* w = args[10];
       const DLTensor* y = args[11];
+      const int n_group = args[12];
 
       MIOpenThreadEntry* entry_ptr = MIOpenThreadEntry::ThreadLocal();
+      assert(n_group > 0 && "Group Size > 0 is expected");
+      if (n_group > 1) assert(mode > 1 && "Group /Depthwise Conv mode when num of groups > 1");
+
       entry_ptr->conv_entry.fwd_algo = static_cast<miopenConvFwdAlgorithm_t>(algo);
       // Set Mode
       entry_ptr->conv_entry.mode = static_cast<miopenConvolutionMode_t>(mode);
@@ -176,10 +181,13 @@ TVM_REGISTER_GLOBAL("tvm.contrib.miopen.conv2d.forward")
       MIOPEN_CALL(miopenInitConvolutionDescriptor(entry_ptr->conv_entry.conv_desc,
                                                   entry_ptr->conv_entry.mode, pad_h, pad_w,
                                                   stride_h, stride_w, dilation_h, dilation_w));
+      if (n_group > 1)
+        MIOPEN_CALL(miopenSetConvolutionGroupCount(entry_ptr->conv_entry.conv_desc, n_group));
+
       // Set Filter
       MIOPEN_CALL(miopenSet4dTensorDescriptor(entry_ptr->conv_entry.filter_desc,
                                               entry_ptr->conv_entry.data_type, w->shape[0],
-                                              w->shape[1], w->shape[2], w->shape[3]));
+                                              w->shape[1] / n_group, w->shape[2], w->shape[3]));
       // Set Input
       MIOPEN_CALL(miopenSet4dTensorDescriptor(entry_ptr->conv_entry.input_desc,
                                               entry_ptr->conv_entry.data_type, x->shape[0],
@@ -188,7 +196,27 @@ TVM_REGISTER_GLOBAL("tvm.contrib.miopen.conv2d.forward")
       MIOPEN_CALL(miopenSet4dTensorDescriptor(entry_ptr->conv_entry.output_desc,
                                               entry_ptr->conv_entry.data_type, y->shape[0],
                                               y->shape[1], y->shape[2], y->shape[3]));
+      
+      // Set workspace
+      size_t workspace_size = 0;
+      MIOPEN_CALL(miopenConvolutionForwardGetWorkSpaceSize(
+          entry_ptr->handle, entry_ptr->conv_entry.filter_desc, entry_ptr->conv_entry.input_desc,
+          entry_ptr->conv_entry.conv_desc, entry_ptr->conv_entry.output_desc, &workspace_size));
+      entry_ptr->conv_entry.UpdateWorkspace(workspace_size);
 
+      const int request_algo_count = 5;
+      const bool exhaustive_search = true;
+      void *workspace = entry_ptr->conv_entry.workspace;
+      if (workspace_size == 0) workspace = nullptr;
+      int returned_algo_count = 0;
+      miopenConvAlgoPerf_t perfs[5];
+
+      MIOPEN_CALL(miopenFindConvolutionForwardAlgorithm(
+          entry_ptr->handle, entry_ptr->conv_entry.input_desc, x->data,
+          entry_ptr->conv_entry.filter_desc, w->data, entry_ptr->conv_entry.conv_desc,
+          entry_ptr->conv_entry.output_desc, y->data, request_algo_count, &returned_algo_count,
+          perfs, workspace, workspace_size, exhaustive_search));
+      
       const float alpha = 1.f;
       const float beta = 0.f;
       MIOPEN_CALL(miopenConvolutionForward(
